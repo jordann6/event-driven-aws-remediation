@@ -1,0 +1,16 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+*.tfvars
+
+# Project Specific
+terraform/lambda.zip
+
+# Python
+__pycache__/
+*.pyc
+
+# OS Specific
+.DS_Store
