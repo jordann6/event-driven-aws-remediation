@@ -8,7 +8,8 @@ graph_attrs = {
     "fontsize": "13",
     "bgcolor": "white",
     "pad": "0.6",
-    "splines": "ortho",
+    "ranksep": "1.0",
+    "nodesep": "0.5",
 }
 
 node_attrs = {
@@ -24,23 +25,24 @@ with Diagram(
     graph_attr=graph_attrs,
     node_attr=node_attrs,
 ):
-    with Cluster("Target Infrastructure"):
-        ec2 = EC2("EC2 Instance\n(app-server)")
+    with Cluster("Trigger Chain"):
+        ec2_mon = EC2("EC2\napp-server")
+        alarm   = CloudwatchAlarm("CloudWatch Alarm\nCPU >= 80% · 2×5 min")
+        eb      = Eventbridge("EventBridge\nstate → ALARM")
 
-    alarm = CloudwatchAlarm("CloudWatch Alarm\nCPU >= 80%\n2 periods × 5 min")
-    eb = Eventbridge("EventBridge Rule\nAlarm State → ALARM")
-
-    with Cluster("Remediation Lambda"):
-        fn = Lambda("event-driven-remediation\nPython 3.13")
+    with Cluster("Remediation Lambda · Python 3.13"):
         role = IAMRole("IAM Role\nleast-privilege")
+        fn   = Lambda("event-driven\nremediation")
 
-    sns = SNS("SNS Topic\nEmail Alert")
-    logs = Cloudwatch("CloudWatch Logs\n14-day retention")
+    with Cluster("Actions"):
+        ec2_fix = EC2("EC2\nreboot / tag")
+        sns     = SNS("SNS\nEmail Alert")
+        logs    = Cloudwatch("CloudWatch Logs\n14-day retention")
 
-    ec2 >> Edge(label="CPUUtilization metric") >> alarm
-    alarm >> Edge(label="state change") >> eb
-    eb >> Edge(label="invoke") >> fn
-    fn - role
-    fn >> Edge(label="reboot / lockdown / tag") >> ec2
-    fn >> Edge(label="publish result") >> sns
-    fn >> Edge(style="dashed") >> logs
+    ec2_mon >> Edge(label="CPUUtilization") >> alarm
+    alarm   >> Edge(label="state change")   >> eb
+    eb      >> Edge(label="invoke")         >> fn
+    role    - fn
+    fn      >> ec2_fix
+    fn      >> sns
+    fn      >> Edge(style="dashed")         >> logs
