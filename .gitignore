@@ -12,5 +12,6 @@ terraform/lambda.zip
 __pycache__/
 *.pyc
 
-# OS Specific
+# OS
 .DS_Store
+.vscode/
