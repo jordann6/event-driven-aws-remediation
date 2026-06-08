@@ -120,13 +120,19 @@ resource "aws_iam_policy" "lambda" {
       {
         Sid      = "TagTargetInstance"
         Effect   = "Allow"
-        Action   = ["ec2:CreateTags", "ec2:DescribeInstances"]
-        Resource = "*"
+        Action   = ["ec2:CreateTags"]
+        Resource = "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/${aws_instance.app.id}"
       },
       {
         Sid      = "LockdownSecurityGroup"
         Effect   = "Allow"
-        Action   = ["ec2:DescribeSecurityGroups", "ec2:RevokeSecurityGroupIngress"]
+        Action   = ["ec2:RevokeSecurityGroupIngress"]
+        Resource = "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:security-group/${aws_security_group.app.id}"
+      },
+      {
+        Sid      = "DescribeEC2Resources"
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeInstances", "ec2:DescribeSecurityGroups"]
         Resource = "*"
       },
       {
