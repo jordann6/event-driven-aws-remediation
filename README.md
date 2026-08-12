@@ -1,6 +1,6 @@
 # Event-Driven AWS Remediation
 
-[![Validate](https://github.com/jordann6/event-driven-aws-remediation/actions/workflows/validate.yml/badge.svg)](https://github.com/jordann6/event-driven-aws-remediation/actions/workflows/validate.yml)
+[![Security Gate](https://github.com/jordann6/event-driven-aws-remediation/actions/workflows/security-gate.yml/badge.svg)](https://github.com/jordann6/event-driven-aws-remediation/actions/workflows/security-gate.yml)
 
 Automated infrastructure remediation triggered by CloudWatch metric alarms. When CPU utilization on the target EC2 instance exceeds 80% for two consecutive 5-minute periods, CloudWatch publishes a state-change event to EventBridge, which invokes a Python Lambda to remediate the instance and notify via SNS — no manual intervention required.
 
