@@ -2,6 +2,7 @@ from diagrams import Diagram, Cluster, Edge
 from diagrams.aws.compute import EC2, Lambda
 from diagrams.aws.management import Cloudwatch, CloudwatchAlarm
 from diagrams.aws.integration import SNS, Eventbridge
+from diagrams.aws.database import Dynamodb
 from diagrams.aws.security import IAMRole
 
 graph_attrs = {
@@ -27,22 +28,29 @@ with Diagram(
 ):
     with Cluster("Trigger Chain"):
         ec2_mon = EC2("EC2\napp-server")
-        alarm   = CloudwatchAlarm("CloudWatch Alarm\nCPU >= 80% · 2×5 min")
-        eb      = Eventbridge("EventBridge\nstate → ALARM")
+        alarm = CloudwatchAlarm("CloudWatch Alarm\nCPU >= 80% · 2×5 min")
+        eb = Eventbridge("EventBridge\nstate → ALARM")
 
     with Cluster("Remediation Lambda · Python 3.13"):
         role = IAMRole("IAM Role\nleast-privilege")
-        fn   = Lambda("event-driven\nremediation")
+        fn = Lambda("guardrail gate\ncooldown · circuit breaker")
 
-    with Cluster("Actions"):
-        ec2_fix = EC2("EC2\nreboot / tag")
-        sns     = SNS("SNS\nEmail Alert")
-        logs    = Cloudwatch("CloudWatch Logs\n14-day retention")
+    state = Dynamodb("DynamoDB\nattempt history (TTL)")
+
+    with Cluster("Safe Remediation"):
+        ec2_fix = EC2("EC2\nreboot / tag / SG")
+        sns = SNS("SNS\nremediation notice")
+        metrics = Cloudwatch("CloudWatch Metrics\nsuccess · skipped · MTTR")
+
+    with Cluster("Escalation"):
+        oncall = SNS("SNS on-call\npage a human")
 
     ec2_mon >> Edge(label="CPUUtilization") >> alarm
-    alarm   >> Edge(label="state change")   >> eb
-    eb      >> Edge(label="invoke")         >> fn
-    role    - fn
-    fn      >> ec2_fix
-    fn      >> sns
-    fn      >> Edge(style="dashed")         >> logs
+    alarm >> Edge(label="state change") >> eb
+    eb >> Edge(label="invoke") >> fn
+    role - fn
+    fn >> Edge(label="check / record", style="dashed") >> state
+    fn >> Edge(label="proceed") >> ec2_fix
+    fn >> sns
+    fn >> Edge(style="dashed") >> metrics
+    fn >> Edge(label="circuit open", color="firebrick", style="bold") >> oncall

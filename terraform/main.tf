@@ -47,6 +47,43 @@ resource "aws_sns_topic_subscription" "email" {
   endpoint  = var.notification_email
 }
 
+# Separate topic for the human-escalation path (circuit breaker + failures).
+# Kept distinct from routine remediation notices so on-call paging can be
+# filtered/subscribed independently.
+resource "aws_sns_topic" "oncall" {
+  name = var.oncall_topic_name
+}
+
+resource "aws_sns_topic_subscription" "oncall_email" {
+  topic_arn = aws_sns_topic.oncall.arn
+  protocol  = "email"
+  endpoint  = var.notification_email
+}
+
+# --- Remediation state (cooldown + circuit breaker) ------------------------
+
+resource "aws_dynamodb_table" "state" {
+  name         = var.state_table_name
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "resource_action"
+
+  attribute {
+    name = "resource_action"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  tags = {
+    Name        = var.state_table_name
+    Environment = "production"
+    ManagedBy   = "terraform"
+  }
+}
+
 # --- EC2 target ------------------------------------------------------------
 
 resource "aws_security_group" "app" {
@@ -106,9 +143,9 @@ resource "aws_iam_policy" "lambda" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "CloudWatchLogs"
-        Effect = "Allow"
-        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Sid      = "CloudWatchLogs"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${var.lambda_function_name}:*"
       },
       {
@@ -139,7 +176,24 @@ resource "aws_iam_policy" "lambda" {
         Sid      = "PublishAlerts"
         Effect   = "Allow"
         Action   = ["sns:Publish"]
-        Resource = aws_sns_topic.alerts.arn
+        Resource = [aws_sns_topic.alerts.arn, aws_sns_topic.oncall.arn]
+      },
+      {
+        Sid      = "RemediationState"
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem"]
+        Resource = aws_dynamodb_table.state.arn
+      },
+      {
+        Sid      = "PublishMetrics"
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = var.metric_namespace
+          }
+        }
       }
     ]
   })
@@ -167,9 +221,16 @@ resource "aws_lambda_function" "remediation" {
 
   environment {
     variables = {
-      INSTANCE_ID   = aws_instance.app.id
-      SG_ID         = aws_security_group.app.id
-      SNS_TOPIC_ARN = aws_sns_topic.alerts.arn
+      INSTANCE_ID            = aws_instance.app.id
+      SG_ID                  = aws_security_group.app.id
+      SNS_TOPIC_ARN          = aws_sns_topic.alerts.arn
+      ONCALL_TOPIC_ARN       = aws_sns_topic.oncall.arn
+      STATE_TABLE            = aws_dynamodb_table.state.name
+      COOLDOWN_SECONDS       = tostring(var.cooldown_seconds)
+      CIRCUIT_WINDOW_SECONDS = tostring(var.circuit_window_seconds)
+      MAX_ATTEMPTS           = tostring(var.max_attempts)
+      METRIC_NAMESPACE       = var.metric_namespace
+      DRY_RUN                = tostring(var.dry_run)
     }
   }
 
@@ -200,7 +261,7 @@ resource "aws_cloudwatch_event_rule" "alarm_to_lambda" {
   description = "Route high-CPU alarm state change to remediation Lambda"
 
   event_pattern = jsonencode({
-    source      = ["aws.cloudwatch"]
+    source        = ["aws.cloudwatch"]
     "detail-type" = ["CloudWatch Alarm State Change"]
     detail = {
       alarmName = [aws_cloudwatch_metric_alarm.high_cpu.alarm_name]

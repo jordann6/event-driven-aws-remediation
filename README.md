@@ -2,7 +2,7 @@
 
 [![Security Gate](https://github.com/jordann6/event-driven-aws-remediation/actions/workflows/security-gate.yml/badge.svg)](https://github.com/jordann6/event-driven-aws-remediation/actions/workflows/security-gate.yml)
 
-Automated infrastructure remediation triggered by CloudWatch metric alarms. When CPU utilization on the target EC2 instance exceeds 80% for two consecutive 5-minute periods, CloudWatch publishes a state-change event to EventBridge, which invokes a Python Lambda to remediate the instance and notify via SNS — no manual intervention required.
+Self-healing infrastructure remediation triggered by CloudWatch metric alarms. When CPU utilization on the target EC2 instance exceeds 80% for two consecutive 5-minute periods, CloudWatch publishes a state-change event to EventBridge, which invokes a Python Lambda. The Lambda does not act blindly: every remediation passes through a **guardrail gate** (cooldown debounce + circuit breaker) backed by DynamoDB, acts only when it is safe to, records the attempt, and escalates to an on-call SNS topic instead of looping when a fix is not holding. Success, skip, escalation, and time-to-remediate are emitted as CloudWatch custom metrics.
 
 ## Architecture
 
@@ -15,10 +15,45 @@ EC2 CPUUtilization metric
   → CloudWatch Alarm (>= 80%, 2 × 5 min)
     → EventBridge rule (Alarm State Change → ALARM)
       → Lambda (Python 3.13)
-        → EC2 remediation action
-        → SNS email notification
-        → CloudWatch Logs (14-day retention)
+          → Guardrail gate (DynamoDB attempt history)
+              ├─ cooldown       → skip (debounce, let the prior action settle)
+              ├─ circuit open    → escalate to on-call SNS (page a human)
+              └─ proceed         → remediate → verify via re-fire → record attempt
+          → SNS remediation notice
+          → CloudWatch custom metrics (success / skipped / escalation / time-to-remediate)
+          → CloudWatch Logs (14-day retention, structured JSON)
 ```
+
+## Why the Guardrail Gate
+
+Naive "high CPU → reboot" automation is dangerous: it can flap, mask a real fault,
+or hammer a fleet during a bad loop. Before any action, the Lambda consults an
+attempt history in DynamoDB (keyed by `resource#action`, TTL-expired) and applies:
+
+| Guardrail | Default | What it prevents |
+|---|---|---|
+| **Cooldown / debounce** | 15 min | Repeating the same action before the last one has had time to settle |
+| **Circuit breaker** | 3 attempts / 60 min | Endless auto-remediation of a fault that automation cannot fix |
+| **Verify-and-escalate** | — | An alarm re-firing inside the window means the fix did not hold → the circuit opens and pages **on-call** instead of acting again |
+| **Dry-run mode** | off | Exercising the full gate + telemetry path with no mutating AWS calls |
+
+This turns a reflex into a bounded control loop that knows when to hand off to a human — the same reasoning an on-call SRE applies by hand.
+
+## Observability
+
+Every invocation emits CloudWatch custom metrics under the `Remediation` namespace
+(dimensions `Action`, `ResourceId`), ready to graph in a CloudWatch or Grafana dashboard:
+
+| Metric | Meaning |
+|---|---|
+| `RemediationSuccess` | Action completed |
+| `RemediationSkipped` | Debounced by cooldown |
+| `RemediationFailure` | Action raised an error (also pages on-call) |
+| `EscalationTriggered` | Circuit opened, handed to a human |
+| `TimeToRemediateMs` | Alarm-fired → remediated latency (MTTR signal) |
+
+Logs are structured JSON with a `request_id`, so each decision (`remediating`,
+`skipped`, `escalated`) is queryable in CloudWatch Logs Insights.
 
 ## Remediation Actions
 
@@ -40,10 +75,11 @@ EventBridge alarm events route to `reboot` automatically. Other actions can be t
 | Security Group | Egress-only by default (ingress added only for testing lockdown) |
 | CloudWatch Alarm | `CPUUtilization >= 80%`, 2 evaluation periods of 5 minutes |
 | EventBridge Rule | Matches `aws.cloudwatch` + alarm name + state `ALARM` |
-| Lambda | Python 3.13, env vars: `INSTANCE_ID`, `SG_ID`, `SNS_TOPIC_ARN` |
-| IAM Role | Least-privilege: reboot scoped to instance ARN, SG actions scoped, SNS publish scoped to topic |
-| SNS Topic | Email subscription for remediation notifications |
-| CloudWatch Logs | `/aws/lambda/event-driven-remediation`, 14-day retention |
+| Lambda | Python 3.13; guardrail gate + remediation; env-tunable cooldown / window / max-attempts / dry-run |
+| DynamoDB | `remediation-state` — attempt history for cooldown + circuit breaker, PAY_PER_REQUEST, TTL-expired |
+| IAM Role | Least-privilege: reboot/tag/SG scoped to resource ARNs, DynamoDB scoped to the table, `PutMetricData` scoped to the `Remediation` namespace, SNS publish scoped to both topics |
+| SNS Topics | `remediation-alerts` (routine notices) + `remediation-oncall` (escalation / failures), each email-subscribed |
+| CloudWatch | Metric alarm (trigger) + custom metrics (`Remediation` namespace) + Logs (`/aws/lambda/event-driven-remediation`, 14-day retention) |
 | Terraform State | S3 backend — `tf-backend-jord-projs` |
 
 ## Deploy
@@ -66,6 +102,13 @@ The `validate.sh` script runs a five-step end-to-end check: verifies the EC2 ins
 ```bash
 cd terraform
 bash ../validate.sh
+```
+
+Guardrail-gate unit tests (cooldown, circuit-breaker escalation, dry-run, window
+pruning) run with no AWS calls — boto clients are stubbed:
+
+```bash
+python3 tests/test_gate.py
 ```
 
 Manual remediation actions:
@@ -96,10 +139,11 @@ aws lambda invoke \
 
 ## Tech Stack
 
-- **Python 3.13** — Lambda runtime
-- **boto3** — EC2 reboot, security group revocation, tag enforcement, SNS publish
+- **Python 3.13** — Lambda runtime, guardrail gate + remediation logic
+- **boto3** — EC2 reboot, security group revocation, tag enforcement, DynamoDB state, CloudWatch metrics, SNS publish
+- **DynamoDB** — attempt history backing the cooldown + circuit breaker (TTL-expired)
 - **Terraform `>= 1.6`** · `aws ~> 5.0` — all infrastructure as code
-- **CloudWatch** — metric alarm, log group
+- **CloudWatch** — metric alarm (trigger), custom metrics (observability), log group
 - **EventBridge** — alarm state change routing
-- **SNS** — email notification on every remediation
+- **SNS** — routine remediation notices + separate on-call escalation topic
 - **GitHub Actions** — OIDC auth, Bandit SAST, pip-audit, terraform validate + apply
